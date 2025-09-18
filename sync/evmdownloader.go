@@ -295,6 +295,7 @@ func (d *EVMDownloaderImplementation) GetEventsByBlockRange(ctx context.Context,
 					return nil
 				}
 
+				b.Hash = l.BlockHash // tmp hardcode code, there are some compatible issue between eSpace RPC and ethereum
 				if b.Hash != l.BlockHash {
 					d.log.Infof(
 						"there has been a block hash change between the event query and the block query "+
