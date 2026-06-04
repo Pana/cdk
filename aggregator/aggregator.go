@@ -502,6 +502,19 @@ func (a *Aggregator) sendFinalProof() {
 				continue
 			}
 
+			proverSR, rpcSR, proverLER, rpcLER, err := compareFinalProofRootsWithRPC(msg.finalProof, rpcFinalBatch)
+			tmpLogger.Infof(
+				"final proof roots: batch=%d proverSR=%s rpcSR=%s proverLER=%s rpcLER=%s",
+				proof.BatchNumberFinal,
+				proverSR, rpcSR, proverLER, rpcLER,
+			)
+			if err != nil {
+				tmpLogger.Errorf("prover/RPC roots mismatch, aborting settlement: %v", err)
+				a.handleFailureToAddVerifyBatchToBeMonitored(ctx, proof)
+				a.endProofVerification()
+				continue
+			}
+
 			inputs := ethmanTypes.FinalProofInputs{
 				FinalProof:       msg.finalProof,
 				NewLocalExitRoot: rpcFinalBatch.LocalExitRoot().Bytes(),

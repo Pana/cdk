@@ -32,6 +32,15 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func newFinalProofWithRoots(stateRoot, localExitRoot common.Hash) *prover.FinalProof {
+	return &prover.FinalProof{
+		Public: &prover.PublicInputsExtended{
+			NewStateRoot:     stateRoot.Bytes(),
+			NewLocalExitRoot: localExitRoot.Bytes(),
+		},
+	}
+}
+
 var (
 	proofID    = "proofId"
 	proof      = "proof"
@@ -254,7 +263,7 @@ func Test_sendFinalProofSuccess(t *testing.T) {
 		BatchNumber:      batchNum,
 		BatchNumberFinal: batchNumFinal,
 	}
-	finalProof := &prover.FinalProof{}
+	finalProof := newFinalProofWithRoots(common.Hash{}, common.Hash{})
 
 	testCases := []struct {
 		name    string
@@ -384,7 +393,7 @@ func Test_sendFinalProofError(t *testing.T) {
 		BatchNumber:      batchNum,
 		BatchNumberFinal: batchNumFinal,
 	}
-	finalProof := &prover.FinalProof{}
+	finalProof := newFinalProofWithRoots(common.Hash{}, common.Hash{})
 
 	testCases := []struct {
 		name    string
@@ -555,6 +564,142 @@ func Test_sendFinalProofError(t *testing.T) {
 			}
 		})
 	}
+}
+
+func Test_compareFinalProofRootsWithRPC(t *testing.T) {
+	t.Parallel()
+
+	rpcSR := common.HexToHash("0x00000000000000000000000000000000000000000000000000000000000000aa")
+	rpcLER := common.HexToHash("0x00000000000000000000000000000000000000000000000000000000000000bb")
+	rpcBatch := rpctypes.NewRPCBatch(1, common.Hash{}, []string{}, []byte{}, common.Hash{}, rpcLER, rpcSR, common.Address{}, true)
+
+	testCases := []struct {
+		name      string
+		finalProof *prover.FinalProof
+		rpcBatch  *rpctypes.RPCBatch
+		wantErr   bool
+	}{
+		{
+			name:      "match",
+			finalProof: newFinalProofWithRoots(rpcSR, rpcLER),
+			rpcBatch:  rpcBatch,
+			wantErr:   false,
+		},
+		{
+			name:      "nil final proof",
+			finalProof: nil,
+			rpcBatch:  rpcBatch,
+			wantErr:   true,
+		},
+		{
+			name:      "nil public inputs",
+			finalProof: &prover.FinalProof{},
+			rpcBatch:  rpcBatch,
+			wantErr:   true,
+		},
+		{
+			name: "invalid state root length",
+			finalProof: &prover.FinalProof{
+				Public: &prover.PublicInputsExtended{
+					NewStateRoot:     []byte("short"),
+					NewLocalExitRoot: rpcLER.Bytes(),
+				},
+			},
+			rpcBatch: rpcBatch,
+			wantErr:  true,
+		},
+		{
+			name:      "state root mismatch",
+			finalProof: newFinalProofWithRoots(common.HexToHash("0x01"), rpcLER),
+			rpcBatch:  rpcBatch,
+			wantErr:   true,
+		},
+		{
+			name:      "local exit root mismatch",
+			finalProof: newFinalProofWithRoots(rpcSR, common.HexToHash("0x02")),
+			rpcBatch:  rpcBatch,
+			wantErr:   true,
+		},
+	}
+
+	for _, tc := range testCases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			_, _, _, _, err := compareFinalProofRootsWithRPC(tc.finalProof, tc.rpcBatch)
+			if tc.wantErr {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}
+
+func Test_sendFinalProof_rootsMismatch(t *testing.T) {
+	assert := assert.New(t)
+
+	batchNum := uint64(23)
+	batchNumFinal := uint64(42)
+	senderAddr := common.BytesToAddress([]byte("sender address")).Hex()
+
+	rpcSR := common.HexToHash("0x00000000000000000000000000000000000000000000000000000000000000aa")
+	rpcLER := common.HexToHash("0x00000000000000000000000000000000000000000000000000000000000000bb")
+	proverSR := common.HexToHash("0x00000000000000000000000000000000000000000000000000000000000000cc")
+	proverLER := common.HexToHash("0x00000000000000000000000000000000000000000000000000000000000000dd")
+
+	recursiveProof := &state.Proof{
+		Prover:           &proverName,
+		ProverID:         &proverID,
+		ProofID:          &proofID,
+		BatchNumber:      batchNum,
+		BatchNumberFinal: batchNumFinal,
+	}
+	finalProof := newFinalProofWithRoots(proverSR, proverLER)
+
+	storageMock := mocks.NewStorageInterfaceMock(t)
+	ethTxManager := mocks.NewEthTxManagerClientMock(t)
+	etherman := mocks.NewEthermanMock(t)
+	rpcMock := mocks.NewRPCInterfaceMock(t)
+
+	batch := rpctypes.NewRPCBatch(batchNumFinal, common.Hash{}, []string{}, []byte{}, common.Hash{}, rpcLER, rpcSR, common.Address{}, false)
+	rpcMock.On("GetBatch", batchNumFinal).Return(batch, nil).Once()
+	storageMock.On("UpdateGeneratedProof", mock.Anything, recursiveProof, nil).Return(nil).Once()
+
+	a := Aggregator{
+		storage:                 storageMock,
+		etherman:                etherman,
+		ethTxManager:            ethTxManager,
+		finalProof:              make(chan finalProofMsg),
+		logger:                  log.GetDefaultLogger(),
+		verifyingProof:          false,
+		storageMutex:            &sync.Mutex{},
+		timeSendFinalProofMutex: &sync.RWMutex{},
+		rpcClient:               rpcMock,
+		accInputHashes:          make(map[uint64]common.Hash),
+		accInputHashesMutex:     &sync.Mutex{},
+		cfg: Config{
+			SettlementBackend: L1,
+			SenderAddress:     senderAddr,
+		},
+	}
+	a.ctx, a.exit = context.WithCancel(context.Background())
+
+	go func() {
+		a.finalProof <- finalProofMsg{
+			proverID:       proverID,
+			recursiveProof: recursiveProof,
+			finalProof:     finalProof,
+		}
+		time.Sleep(100 * time.Millisecond)
+		a.exit()
+	}()
+
+	a.sendFinalProof()
+
+	assert.False(a.verifyingProof)
+	etherman.AssertNotCalled(t, "BuildTrustedVerifyBatchesTxData", mock.Anything, mock.Anything, mock.Anything, mock.Anything)
+	ethTxManager.AssertNotCalled(t, "Add", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything)
 }
 
 func Test_buildFinalProof(t *testing.T) {
