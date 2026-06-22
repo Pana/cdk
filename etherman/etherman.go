@@ -497,3 +497,8 @@ func (etherMan *Client) GetL1InfoRoot(indexL1InfoRoot uint32) (common.Hash, erro
 
 	return lastL1InfoTreeRoot, err
 }
+
+// GetTransactionReceipt returns the receipt of a transaction by its hash.
+func (etherMan *Client) GetTransactionReceipt(ctx context.Context, txHash common.Hash) (*types.Receipt, error) {
+	return etherMan.EthClient.TransactionReceipt(ctx, txHash)
+}
