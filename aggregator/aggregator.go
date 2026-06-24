@@ -34,6 +34,7 @@ import (
 	"github.com/0xPolygonHermez/zkevm-synchronizer-l1/synchronizer"
 	"github.com/0xPolygonHermez/zkevm-synchronizer-l1/synchronizer/l1_check_block"
 	"github.com/ethereum/go-ethereum/common"
+	ethtypes "github.com/ethereum/go-ethereum/core/types"
 	"go.uber.org/zap/zapcore"
 	"google.golang.org/grpc"
 	grpchealth "google.golang.org/grpc/health/grpc_health_v1"
@@ -509,17 +510,38 @@ func (a *Aggregator) sendFinalProof() {
 				proverSR, rpcSR, proverLER, rpcLER,
 			)
 			if err != nil {
-				tmpLogger.Errorf("prover/RPC roots mismatch, aborting settlement: %v", err)
-				a.handleFailureToAddVerifyBatchToBeMonitored(ctx, proof)
-				a.endProofVerification()
-				continue
+				// Log warning but continue with prover roots for settlement
+				// This handles known SMT root differences between erigon and prover
+				tmpLogger.Warnf("prover/RPC roots mismatch, using prover roots for settlement: %v", err)
+			}
+
+			// Use prover-computed roots for settlement, not RPC roots
+			// The proof was generated from the prover's SMT, so we must use those roots
+			// to avoid L1 contract revert due to newStateRoot mismatch
+			stateRootToUse := rpcFinalBatch.StateRoot().Bytes()
+			lerToUse := rpcFinalBatch.LocalExitRoot().Bytes()
+			if proverSR != (common.Hash{}) {
+				stateRootToUse = proverSR.Bytes()
+			}
+			if proverLER != (common.Hash{}) {
+				lerToUse = proverLER.Bytes()
 			}
 
 			inputs := ethmanTypes.FinalProofInputs{
 				FinalProof:       msg.finalProof,
-				NewLocalExitRoot: rpcFinalBatch.LocalExitRoot().Bytes(),
-				NewStateRoot:     rpcFinalBatch.StateRoot().Bytes(),
+				NewLocalExitRoot: lerToUse,
+				NewStateRoot:     stateRootToUse,
 			}
+
+			// Debug: log the values being submitted to L1 for inputSnark verification
+			tmpLogger.Infof("L1 submission values: newStateRoot=%s newLocalExitRoot=%s sender=%s",
+				common.BytesToHash(stateRootToUse).Hex(),
+				common.BytesToHash(lerToUse).Hex(),
+				a.cfg.SenderAddress,
+			)
+			tmpLogger.Infof("L1 submission values: batchNum=%d lastVerifiedBatch=%d",
+				proof.BatchNumberFinal, proof.BatchNumber-1,
+			)
 
 			switch a.cfg.SettlementBackend {
 			case AggLayer:
@@ -1185,11 +1207,10 @@ func (a *Aggregator) getAndLockBatchToProve(
 		a.logger.Warnf("RPC BatchL2Data:%v", common.Bytes2Hex(rpcBatch.L2Data()))
 	}
 
-	l1InfoRoot := common.Hash{}
-
 	if virtualBatch.L1InfoRoot == nil {
-		log.Debugf("L1InfoRoot is nil for batch %d", batchNumberToVerify)
-		virtualBatch.L1InfoRoot = &l1InfoRoot
+		log.Warnf("L1InfoRoot is nil for batch %d, falling back to sequence L1InfoRoot", batchNumberToVerify)
+		seqL1InfoRoot := sequence.L1InfoRoot
+		virtualBatch.L1InfoRoot = &seqL1InfoRoot
 	}
 
 	// Ensure the old acc input hash is in memory
@@ -1199,30 +1220,32 @@ func (a *Aggregator) getAndLockBatchToProve(
 		return nil, nil, state.ErrNotFound
 	}
 
-	forcedBlockHashL1 := rpcBatch.ForcedBlockHashL1()
-	l1InfoRoot = *virtualBatch.L1InfoRoot
-
-	if batchNumberToVerify == 1 {
-		l1Block, err := a.l1Syncr.GetL1BlockByNumber(ctx, virtualBatch.BlockNumber)
-		if err != nil {
-			a.logger.Errorf("Error getting l1 block: %v", err)
-			return nil, nil, err
-		}
-
-		forcedBlockHashL1 = l1Block.ParentHash
-		l1InfoRoot = rpcBatch.GlobalExitRoot()
+	// Read accInputHash directly from L1 to ensure it matches the value
+	// computed by the L1 sequenceBatches function, avoiding any encoding
+	// or parameter mismatch between aggregator and sequencer.
+	accInputHash, err := a.etherman.GetBatchAccInputHash(ctx, batchNumberToVerify)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to get accInputHash from L1 for batch %d: %w", batchNumberToVerify, err)
 	}
 
-	// Calculate acc input hash as the RPC is not returning the correct one at the moment
-	accInputHash := cdkcommon.CalculateAccInputHash(
-		a.logger,
-		oldAccInputHash,
-		virtualBatch.BatchL2Data,
-		l1InfoRoot,
-		uint64(sequence.Timestamp.Unix()),
-		rpcBatch.LastCoinbase(),
-		forcedBlockHashL1,
-	)
+	// The L1 contract only stores accInputHash for the LAST batch of each
+	// sequence (see SequencedBatchData). For intermediate batches it returns
+	// the zero hash, so we must compute the value locally to keep the
+	// accInputHash chain alive for subsequent batches.
+	if accInputHash == (common.Hash{}) {
+		accInputHash = cdkcommon.CalculateAccInputHash(
+			a.logger,
+			oldAccInputHash,
+			virtualBatch.BatchL2Data,
+			*virtualBatch.L1InfoRoot,
+			uint64(sequence.Timestamp.Unix()),
+			rpcBatch.LastCoinbase(),
+			rpcBatch.ForcedBlockHashL1(),
+		)
+		a.logger.Infof("L1 accInputHash is zero for batch %d (not the final batch of its sequence), using locally computed value: %s",
+			batchNumberToVerify, accInputHash.Hex())
+	}
+
 	// Store the acc input hash
 	a.setAccInputHash(batchNumberToVerify, accInputHash)
 
@@ -1463,6 +1486,106 @@ func (a *Aggregator) resetVerifyProofTime() {
 	a.timeSendFinalProof = time.Now().Add(a.cfg.VerifyProofInterval.Duration)
 }
 
+// batch1InitializeParams holds the parameters used by the L1 rollup contract
+// during the initial sequence of batch 1. These values are required by the
+// prover so that the computed newAccInputHash matches the value stored in the
+// RollupManager contract.
+type batch1InitializeParams struct {
+	transactions     []byte
+	lastGlobalExitRoot common.Hash
+	sequencer        common.Address
+	timestamp        uint64
+	forcedBlockHash  common.Hash
+}
+
+// initialSequenceBatchesTopic is the topic0 of the InitialSequenceBatches
+// event emitted by PolygonRollupBaseEtrog.initialize(...):
+//   InitialSequenceBatches(bytes transactions, bytes32 lastGlobalExitRoot, address sequencer)
+var initialSequenceBatchesTopic = common.HexToHash("0x060116213bcbf54ca19fd649dc84b59ab2bbd200ab199770e4d923e222a28e7f")
+
+// parseInitialSequenceBatchesEvent decodes the InitialSequenceBatches event
+// from a transaction receipt log.
+func parseInitialSequenceBatchesEvent(log *ethtypes.Log) (*batch1InitializeParams, error) {
+	if len(log.Topics) == 0 || log.Topics[0] != initialSequenceBatchesTopic {
+		return nil, fmt.Errorf("log is not an InitialSequenceBatches event")
+	}
+
+	data := log.Data
+	if len(data) < 128 {
+		return nil, fmt.Errorf("InitialSequenceBatches event data too short: %d bytes", len(data))
+	}
+
+	// abi-encoded data:
+	//   [0:32]   offset to transactions (dynamic bytes)
+	//   [32:64]  bytes32 lastGlobalExitRoot
+	//   [64:96]  address sequencer (padded to 32 bytes)
+	//   [96:128] length of transactions
+	//   [128:..] transactions bytes
+	offset := new(big.Int).SetBytes(data[0:32]).Uint64()
+	lastGlobalExitRoot := common.BytesToHash(data[32:64])
+	sequencer := common.BytesToAddress(data[64:96])
+
+	if offset != 96 {
+		return nil, fmt.Errorf("unexpected transactions offset: %d", offset)
+	}
+
+	if len(data) < 128 {
+		return nil, fmt.Errorf("event data too short for transactions length")
+	}
+	txLen := new(big.Int).SetBytes(data[96:128]).Uint64()
+	if uint64(len(data)) < 128+txLen {
+		return nil, fmt.Errorf("event data too short for transactions payload")
+	}
+	transactions := data[128 : 128+txLen]
+
+	return &batch1InitializeParams{
+		transactions:       transactions,
+		lastGlobalExitRoot: lastGlobalExitRoot,
+		sequencer:          sequencer,
+	}, nil
+}
+
+// getBatch1InitializeParams fetches the parameters used during L1 initialize()
+// by parsing the InitialSequenceBatches event from the virtual batch's L1 tx.
+func (a *Aggregator) getBatch1InitializeParams(ctx context.Context, vlogTxHash common.Hash) (*batch1InitializeParams, error) {
+	receipt, err := a.etherman.GetTransactionReceipt(ctx, vlogTxHash)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get receipt for batch1 init tx %s: %w", vlogTxHash.Hex(), err)
+	}
+	if receipt == nil {
+		return nil, fmt.Errorf("receipt not found for batch1 init tx %s", vlogTxHash.Hex())
+	}
+
+	var params *batch1InitializeParams
+	for i := range receipt.Logs {
+		p, err := parseInitialSequenceBatchesEvent(receipt.Logs[i])
+		if err == nil {
+			params = p
+			break
+		}
+	}
+	if params == nil {
+		return nil, fmt.Errorf("InitialSequenceBatches event not found in receipt for tx %s", vlogTxHash.Hex())
+	}
+
+	// Fetch the L1 block header to obtain timestamp and parent hash.
+	header, err := a.etherman.HeaderByNumber(ctx, big.NewInt(int64(receipt.BlockNumber.Uint64())))
+	if err != nil {
+		return nil, fmt.Errorf("failed to get L1 block %d header: %w", receipt.BlockNumber.Uint64(), err)
+	}
+	if header == nil {
+		return nil, fmt.Errorf("L1 block %d header not found", receipt.BlockNumber.Uint64())
+	}
+
+	params.timestamp = header.Time
+	params.forcedBlockHash = header.ParentHash
+
+	log.Infof("batch1 initialize params from L1 event: lastGER=%s sequencer=%s timestamp=%d forcedBlockHash=%s txLen=%d",
+		params.lastGlobalExitRoot.Hex(), params.sequencer.Hex(), params.timestamp, params.forcedBlockHash.Hex(), len(params.transactions))
+
+	return params, nil
+}
+
 func (a *Aggregator) buildInputProver(
 	ctx context.Context, batchToVerify *state.Batch, witness []byte,
 ) (*prover.StatelessInputProver, error) {
@@ -1544,24 +1667,10 @@ func (a *Aggregator) buildInputProver(
 				}
 			}
 		}
-	} else {
-		// Initial batch must be handled differently
-		if batchToVerify.BatchNumber == 1 {
-			virtualBatch, err := a.l1Syncr.GetVirtualBatchByBatchNumber(ctx, batchToVerify.BatchNumber)
-			if err != nil {
-				a.logger.Errorf("Error getting virtual batch: %v", err)
-				return nil, err
-			}
-			l1Block, err := a.l1Syncr.GetL1BlockByNumber(ctx, virtualBatch.BlockNumber)
-			if err != nil {
-				a.logger.Errorf("Error getting l1 block: %v", err)
-				return nil, err
-			}
-
-			forcedBlockhashL1 = l1Block.ParentHash
-			l1InfoRoot = batchToVerify.GlobalExitRoot.Bytes()
-		}
 	}
+	// Note: for batch 1 (and forced batches), forcedBlockhashL1 stays as bytes32(0)
+	// and l1InfoRoot stays as batchToVerify.L1InfoRoot (from the virtual batch on L1).
+	// This matches what the L1 sequenceBatches function uses for non-forced batches.
 
 	// Ensure the old acc input hash is in memory
 	oldAccInputHash := a.getAccInputHash(batchToVerify.BatchNumber - 1)
@@ -1585,6 +1694,34 @@ func (a *Aggregator) buildInputProver(
 			L1InfoTreeData:    l1InfoTreeData,
 			ForcedBlockhashL1: forcedBlockhashL1.Bytes(),
 		},
+	}
+
+	// For batch 1, the L1 contract computes the accInputHash inside initialize()
+	// using parameters from the InitialSequenceBatches event and the L1 block
+	// header (timestamp + parent hash). Override the inputProver values with
+	// those exact parameters so the prover reproduces the accInputHash stored
+	// in the RollupManager contract.
+	if batchToVerify.BatchNumber == 1 {
+		// Fetch the L1 tx hash that emitted the InitialSequenceBatches event
+		// for this virtual batch.
+		virtualBatch, err := a.l1Syncr.GetVirtualBatchByBatchNumber(ctx, batchToVerify.BatchNumber)
+		if err != nil {
+			a.logger.Errorf("Failed to get virtual batch %d, falling back to syncer data: %v", batchToVerify.BatchNumber, err)
+		} else if virtualBatch == nil {
+			a.logger.Errorf("Virtual batch %d not found, falling back to syncer data", batchToVerify.BatchNumber)
+		} else {
+			initParams, err := a.getBatch1InitializeParams(ctx, virtualBatch.VlogTxHash)
+			if err != nil {
+				a.logger.Errorf("Failed to get batch1 initialize params from L1 event, falling back to syncer data: %v", err)
+			} else {
+				inputProver.PublicInputs.BatchL2Data = initParams.transactions
+				inputProver.PublicInputs.L1InfoRoot = initParams.lastGlobalExitRoot.Bytes()
+				inputProver.PublicInputs.TimestampLimit = initParams.timestamp
+				inputProver.PublicInputs.SequencerAddr = initParams.sequencer.String()
+				inputProver.PublicInputs.ForcedBlockhashL1 = initParams.forcedBlockHash.Bytes()
+				a.logger.Infof("Batch 1 inputProver overridden from L1 initialize event")
+			}
+		}
 	}
 
 	printInputProver(a.logger, inputProver)

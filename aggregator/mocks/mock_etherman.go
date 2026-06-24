@@ -374,6 +374,65 @@ func (_c *EthermanMock_HeaderByNumber_Call) RunAndReturn(run func(context.Contex
 	return _c
 }
 
+// GetTransactionReceipt provides a mock function with given fields: ctx, txHash
+func (_m *EthermanMock) GetTransactionReceipt(ctx context.Context, txHash common.Hash) (*types.Receipt, error) {
+	ret := _m.Called(ctx, txHash)
+
+	if len(ret) == 0 {
+		panic("no return value specified for GetTransactionReceipt")
+	}
+
+	var r0 *types.Receipt
+	var r1 error
+	if rf, ok := ret.Get(0).(func(context.Context, common.Hash) (*types.Receipt, error)); ok {
+		return rf(ctx, txHash)
+	}
+	if rf, ok := ret.Get(0).(func(context.Context, common.Hash) *types.Receipt); ok {
+		r0 = rf(ctx, txHash)
+	} else {
+		if ret.Get(0) != nil {
+			r0 = ret.Get(0).(*types.Receipt)
+		}
+	}
+
+	if rf, ok := ret.Get(1).(func(context.Context, common.Hash) error); ok {
+		r1 = rf(ctx, txHash)
+	} else {
+		r1 = ret.Error(1)
+	}
+
+	return r0, r1
+}
+
+// EthermanMock_GetTransactionReceipt_Call is a *mock.Call that shadows Run/Return methods with type explicit version for method 'GetTransactionReceipt'
+type EthermanMock_GetTransactionReceipt_Call struct {
+	*mock.Call
+}
+
+// GetTransactionReceipt is a helper method to define mock.On call
+//   - ctx context.Context
+//   - txHash common.Hash
+func (_e *EthermanMock_Expecter) GetTransactionReceipt(ctx interface{}, txHash interface{}) *EthermanMock_GetTransactionReceipt_Call {
+	return &EthermanMock_GetTransactionReceipt_Call{Call: _e.mock.On("GetTransactionReceipt", ctx, txHash)}
+}
+
+func (_c *EthermanMock_GetTransactionReceipt_Call) Run(run func(ctx context.Context, txHash common.Hash)) *EthermanMock_GetTransactionReceipt_Call {
+	_c.Call.Run(func(args mock.Arguments) {
+		run(args[0].(context.Context), args[1].(common.Hash))
+	})
+	return _c
+}
+
+func (_c *EthermanMock_GetTransactionReceipt_Call) Return(_a0 *types.Receipt, _a1 error) *EthermanMock_GetTransactionReceipt_Call {
+	_c.Call.Return(_a0, _a1)
+	return _c
+}
+
+func (_c *EthermanMock_GetTransactionReceipt_Call) RunAndReturn(run func(context.Context, common.Hash) (*types.Receipt, error)) *EthermanMock_GetTransactionReceipt_Call {
+	_c.Call.Return(run)
+	return _c
+}
+
 // NewEthermanMock creates a new instance of EthermanMock. It also registers a testing interface on the mock and a cleanup function to assert the mocks expectations.
 // The first argument is typically a *testing.T value.
 func NewEthermanMock(t interface {

@@ -45,6 +45,7 @@ type Etherman interface {
 	GetLatestBlockHeader(ctx context.Context) (*ethtypes.Header, error)
 	GetBatchAccInputHash(ctx context.Context, batchNumber uint64) (common.Hash, error)
 	HeaderByNumber(ctx context.Context, number *big.Int) (*ethtypes.Header, error)
+	GetTransactionReceipt(ctx context.Context, txHash common.Hash) (*ethtypes.Receipt, error)
 }
 
 // aggregatorTxProfitabilityChecker interface for different profitability
